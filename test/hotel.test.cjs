@@ -59,13 +59,10 @@ test('supplier endpoints normalize cities and honor outage flags', () => {
 test('aggregation completes the workflow before applying the Redis price range', async (t) => {
   let completed = false;
   const offer = { name: 'Holtin', price: 5340, supplier: 'Supplier B', commissionPct: 20 };
-  t.mock.method(redis, 'zrangebyscore', async (...args) => {
+  t.mock.method(redis, 'eval', async (script, keyCount, ...args) => {
     assert.equal(completed, true);
-    assert.deepEqual(args, ['hotels:delhi:by-price', 5000, 8000]);
-    return ['Holtin'];
-  });
-  t.mock.method(redis, 'hmget', async (...args) => {
-    assert.deepEqual(args, ['hotels:delhi:data', 'Holtin']);
+    assert.equal(keyCount, 2);
+    assert.deepEqual(args, ['hotels:{delhi}:by-price', 'hotels:{delhi}:data', 5000, 8000]);
     return [JSON.stringify(offer)];
   });
   const aggregate = createHotelService({ workflow: { execute: async (name, options) => {

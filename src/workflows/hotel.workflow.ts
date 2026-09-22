@@ -9,12 +9,13 @@ const { fetchSupplierA, fetchSupplierB } = proxyActivities<typeof supplierActivi
   retry: { maximumAttempts: 3 },
 });
 
-const { persistHotels } = proxyActivities<typeof redisActivities>({
+const { beginHotelRefresh, persistHotels } = proxyActivities<typeof redisActivities>({
   startToCloseTimeout: '10 seconds',
   retry: { maximumAttempts: 3 },
 });
 
 export async function hotelOfferWorkflow(city: string): Promise<HotelOffer[]> {
+  const refresh = await beginHotelRefresh(city);
   // Temporal executes these two activities independently and waits for both.
   const [supplierA, supplierB] = await Promise.all([
     fetchSupplierA(city),
@@ -40,6 +41,6 @@ export async function hotelOfferWorkflow(city: string): Promise<HotelOffer[]> {
   for (const hotel of supplierB) consider(hotel, 'Supplier B');
 
   const result = Array.from(byName.values()).sort((a, b) => a.price - b.price || a.name.localeCompare(b.name));
-  await persistHotels(city, result);
+  await persistHotels(city, result, refresh);
   return result;
 }

@@ -1,8 +1,10 @@
 import { saveHotels, getHotelsByPrice } from '../models/hotel.model';
-import type { HotelOffer } from '../types/hotel.types';
+import type { HotelOffer, HotelRefresh } from '../types/hotel.types';
 
-export async function persistHotels(city: string, hotels: HotelOffer[]): Promise<void> {
-  await saveHotels(city, hotels);
+export { beginHotelRefresh } from '../models/hotel.model';
+
+export async function persistHotels(city: string, hotels: HotelOffer[], refresh: HotelRefresh): Promise<boolean> {
+  return saveHotels(city, hotels, refresh);
 }
 
 export async function queryHotelsFromRedis(

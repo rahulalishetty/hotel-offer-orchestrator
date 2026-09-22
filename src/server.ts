@@ -1,32 +1,47 @@
-import { createApp } from "./app";
-import { redis } from "./config/db.config";
-import { env } from "./config/env.config";
-import { logger } from "./config/logging.config";
-import { createTemporalClient } from "./config/temporal.config";
-import { createHotelService } from "./services/hotel.service";
+import type { Server } from 'node:http';
+import type { Client } from '@temporalio/client';
+import { createApp } from './app';
+import { redis, closeRedis } from './config/db.config';
+import { env } from './config/env.config';
+import { logger } from './config/logging.config';
+import { createTemporalClient } from './config/temporal.config';
+import { createHotelService } from './services/hotel.service';
+import { runService } from './utils/shutdown.utils';
 
-async function start(): Promise<void> {
-  const temporalClient = await createTemporalClient();
-  await redis.connect();
-  const app = createApp(createHotelService(temporalClient));
+let server: Server | undefined;
+let temporalClient: Client | undefined;
 
-  // start the server to listen for requests inside a promise to handle errors occured
-  // in the following .catch block or else the error will be ignored
-  await new Promise<void>((resolve, reject) => {
-    app.listen(env.port, (error?: Error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-
-      resolve();
+runService({
+  name: 'API',
+  timeoutMs: env.shutdownTimeoutMs,
+  async start() {
+    temporalClient = await createTemporalClient();
+    await redis.connect();
+    const app = createApp(createHotelService(temporalClient));
+    await new Promise<void>((resolve, reject) => {
+      server = app.listen(env.port);
+      server.once('error', reject);
+      server.once('listening', () => {
+        server!.off('error', reject);
+        resolve();
+      });
     });
-  });
-
-  logger.info({ port: env.port }, "Hotel API listening");
-}
-
-start().catch((error) => {
-  logger.error({ err: error }, "API failed to start");
-  process.exit(1);
+    logger.info({ port: env.port }, 'Hotel API listening');
+  },
+  async drain() {
+    if (!server?.listening) return;
+    const currentServer = server;
+    await new Promise<void>((resolve, reject) => {
+      currentServer.close(error => error ? reject(error) : resolve());
+      currentServer.closeIdleConnections();
+    });
+  },
+  close: [
+    async () => { await temporalClient?.connection.close(); },
+    closeRedis,
+  ],
+  forceClose() {
+    server?.closeAllConnections();
+    redis.disconnect();
+  },
 });

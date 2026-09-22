@@ -10,3 +10,8 @@ export interface HotelQuery {
   minPrice?: number;
   maxPrice?: number;
 }
+
+export interface HotelRefresh {
+  version: string;
+  expiresAt: number;
+}

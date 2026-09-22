@@ -58,8 +58,8 @@ A production-shaped reference implementation of a hotel offer aggregator using:
 
 For every city the service maintains:
 
-- `hotels:<city>:by-price` — Redis sorted set, where the score is the selected hotel price and the member is the normalized hotel name.
-- `hotels:<city>:data` — Redis hash, where the field is the normalized hotel name and the value is the serialized final offer.
+- `hotels:{<city>}:by-price` — Redis sorted set, where the score is the selected hotel price and the member is the selected hotel name.
+- `hotels:{<city>}:data` — Redis hash, where the field is the selected hotel name and the value is the serialized final offer.
 
 The filtered API request uses `ZRANGEBYSCORE`, so the price predicate is evaluated by Redis rather than by downloading all records and filtering them in Node.js.
 
@@ -67,7 +67,7 @@ The filtered API request uses `ZRANGEBYSCORE`, so the price predicate is evaluat
 
 1. `GET /api/hotels?city=delhi` reaches Express.
 2. Express starts `hotelOfferWorkflow` on Temporal.
-3. The workflow invokes Supplier A and Supplier B activities concurrently using `Promise.all`.
+3. The workflow allocates a Redis refresh version and expiry, then invokes Supplier A and Supplier B activities concurrently using `Promise.all`.
 4. Each activity calls the corresponding mock supplier endpoint.
 5. The workflow normalizes hotel names and keeps the cheapest offer for each name.
 6. The workflow sorts the final list and persists it to Redis through an activity.
@@ -143,14 +143,14 @@ docker compose up --build
 
 Services:
 
-| Service | URL / Port | Purpose |
-|---|---:|---|
-| API | http://localhost:3000 | Express API + mock suppliers |
-| Temporal | localhost:7233 | Workflow service |
-| Temporal UI | http://localhost:8080 | Workflow inspection |
-| Redis | internal `redis:6379` | Offer persistence/filtering |
-| PostgreSQL | internal only | Temporal persistence |
-| Worker | internal | Temporal workflow/activity worker |
+| Service     |            URL / Port | Purpose                           |
+| ----------- | --------------------: | --------------------------------- |
+| API         | http://localhost:3000 | Express API + mock suppliers      |
+| Temporal    |        localhost:7233 | Workflow service                  |
+| Temporal UI | http://localhost:8080 | Workflow inspection               |
+| Redis       | internal `redis:6379` | Offer persistence/filtering       |
+| PostgreSQL  |         internal only | Temporal persistence              |
+| Worker      |              internal | Temporal workflow/activity worker |
 
 Stop the stack:
 
@@ -300,17 +300,29 @@ Open Temporal UI at http://localhost:8080 and inspect the `hotel-offer-task-queu
 Example keys after a Delhi request:
 
 ```text
-hotels:delhi:by-price
-hotels:delhi:data
+hotels:{delhi}:by-price
+hotels:{delhi}:data
 ```
 
 The sorted set allows the filter to be implemented as:
 
 ```text
-ZRANGEBYSCORE hotels:delhi:by-price 5000 8000
+ZRANGEBYSCORE hotels:{delhi}:by-price 5000 8000
 ```
 
-The returned names are then looked up from the hash.
+The returned names are looked up from the hash inside the same Lua script, so a writer cannot change the snapshot between selecting names and reading prices.
+
+### TTL, versions, and atomic operations
+
+Set `HOTEL_OFFER_TTL_SECONDS` on the worker (default: `300`). The freshness window starts before supplier fetching, using Redis server time. Both data keys receive the same absolute `PEXPIREAT` deadline. Slow fetches consume that window, and retries never extend it. Expired snapshots read as `[]`; every API request still starts a supplier refresh.
+
+`beginHotelRefresh` atomically increments `hotels:{delhi}:version` and returns the version and deadline. `saveHotels` runs a Lua script that checks this version and deadline, replaces the sorted set and hash, and applies expiry in one atomic operation. An empty result clears the previous snapshot. A superseded or expired write returns `false` without changing the cache.
+
+The policy is **latest refresh started wins**. If a newer refresh fails, an older in-flight refresh cannot publish; the previous cached snapshot remains available only until its original expiry. The small version counter intentionally has no TTL, preventing delayed activities from reusing a version after the offers expire. Retire it only when no activities for that city can still run.
+
+A pipeline only batches commands; it does not prevent interleaving. `MULTI/EXEC` can make a fixed batch atomic, but these operations need conditional checks and reads whose results determine subsequent commands, so Lua performs them on Redis. The read script combines `ZRANGEBYSCORE` and hash lookups; the write script combines version checking, replacement, and expiry. Each script is atomic independently; workflow completion plus the API read is not one transaction, so concurrent requests may return a newer city's snapshot.
+
+Keys share a city hash tag for Redis Cluster compatibility. This changes the old key namespace; old untagged keys are no longer read and should be removed during migration. Deploy the API and worker together and drain old workflows before upgrading because the workflow activity sequence has changed. Scripts run to completion on Redis, so bound supplier result sizes for large deployments.
 
 This also avoids using Redis `KEYS` for request-time filtering.
 
@@ -365,18 +377,18 @@ npm run start:worker
 
 ## Tests
 
-Run `npm test` to compile TypeScript and check query validation, HTTP response contracts, supplier outage behavior, and workflow-to-Redis sequencing with mocked dependencies. These tests do not require running Redis or Temporal.
+Run `npm test` to compile TypeScript and check query validation, HTTP response contracts, supplier outage behavior, and workflow-to-Redis sequencing with mocked dependencies. The API tests do not require Redis or Temporal. If `redis-server` is installed, the Redis integration test starts an isolated instance using a temporary Unix socket and checks version rejection, TTL, retry deadlines, empty snapshots, and concurrent reads/writes; otherwise that test is skipped.
 
-## Production considerations
+## Graceful shutdown
 
-This implementation is intentionally compact for an assignment, but the boundaries are suitable for extending it:
+Both processes handle `SIGINT` (Ctrl+C) and `SIGTERM` (container stop). Repeated signals share one shutdown operation.
 
-- Add supplier-specific timeout/circuit-breaker policies.
-- Use Temporal retry policies with non-retryable error types for validation failures.
-- Add request correlation IDs and propagate them into Temporal workflow/activity logs.
-- Consider a deterministic workflow ID per city plus an explicit refresh policy if repeated requests should share work.
-- Add Redis TTL/versioning if supplier offers become stale.
-- Add contract tests for supplier responses.
-- Add unit tests for the pure deduplication/comparison function.
-- Add graceful shutdown for Express, Temporal connections, and Redis.
-- Add metrics for supplier latency/error rate, workflow duration, Redis latency, and aggregation result counts.
+- **API:** stops accepting connections, closes idle HTTP connections, and waits for active requests to finish. It then closes its Temporal client connection and Redis connection.
+- **Worker:** stops polling Temporal and drains active activities/workflow tasks before closing its native Temporal connection and Redis. Temporal workflows remain durable; stopping this worker does not cancel them.
+- **Redis:** sends `QUIT` on a ready connection, then disconnects. Unused or broken connections are disconnected directly.
+
+`SHUTDOWN_TIMEOUT_MS` sets the overall shutdown deadline in milliseconds (default `30000`). The worker allows activities 80% of this budget before Temporal requests cancellation. If startup, draining, or closing connections hangs beyond the overall deadline, the process forces local connections closed and exits with code `1`. Normal shutdown exits naturally; startup or cleanup failures also set exit code `1`, while still attempting remaining cleanup.
+
+Handlers are installed before startup, so a signal during connection setup waits for startup to settle and then cleans up acquired resources within the same deadline. Docker Compose gives the API and worker `40s` to stop; increase `stop_grace_period` if you increase the application deadline. Requests exceeding the deadline may be interrupted. The API hosts the mock supplier endpoints too, so supplier requests during a full-stack shutdown can fail and be retried by Temporal after restart.
+
+Shutdown tests cover both signals, repeated signals, startup failure, cleanup failure, Redis disconnection, and a forced exit when draining hangs. They use child processes and mocked service resources; they do not require a live Temporal cluster.
